@@ -1,0 +1,55 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: compile eBPF · vet · unit tests · build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Install clang / llvm
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm
+      - name: Compile eBPF object from source (overwrites the committed one)
+        run: make bpf && llvm-objdump -h bpf/netmon.bpf.o | grep -E 'cgroup_skb|maps|BTF'
+      - name: Lint
+        run: make lint
+      - name: Unit tests (race + coverage)
+        run: go test -race -coverprofile=cover.out ./... && go tool cover -func=cover.out | tail -1
+      - name: Build static binary
+        run: make build && ./bin/netmon -demo -ticks 2 -interval 200ms -listen ""
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netmon-linux-amd64
+          path: bin/netmon
+
+  kernel-integration:
+    name: load + attach on a real kernel (sudo)
+    needs: build-test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Install clang / llvm
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm
+      - name: Compile eBPF object
+        run: make bpf
+      - name: Kernel info
+        run: uname -a && mount | grep cgroup2
+      - name: Verifier + attach + loopback accounting test
+        run: make integration
