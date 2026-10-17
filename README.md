@@ -1,19 +1,15 @@
 # ebpf-netmon
 
 [![ci](https://github.com/HOFFMAN-ALTERNATIVE/ebpf-netmon/actions/workflows/ci.yml/badge.svg)](https://github.com/HOFFMAN-ALTERNATIVE/ebpf-netmon/actions/workflows/ci.yml)
-![Go](https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go)
+![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)
 ![eBPF](https://img.shields.io/badge/eBPF-cilium%2Febpf-F7B93E)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-**Per-flow network accounting in the kernel, top-talkers in your terminal, Prometheus on the side.**
+See which flows are moving bytes on a Linux host, per IPv4/IPv6 5-tuple, without sniffing packets in user space. Two small `cgroup_skb` programs (ingress and egress) attach to a cgroup v2 hierarchy, the whole host by default, and count packets and bytes in an LRU hash map in the kernel. A Go agent built on cilium/ebpf reads the aggregated counters, prints a top-talkers table and exports bounded-cardinality Prometheus metrics.
 
-`ebpf-netmon` attaches two tiny `cgroup_skb` programs (ingress + egress) to a cgroup v2 hierarchy —
-the whole host by default — and counts packets and bytes per IPv4/IPv6 5-tuple in an LRU hash map.
-Nothing is copied to user space per packet; the Go agent only reads aggregated counters,
-so overhead stays flat even under heavy traffic.
+Every CI run compiles the BPF object from source, loads it through the verifier on a real kernel, attaches it to the root cgroup, pushes 1 MiB over loopback and asserts both directions were counted.
 
-Built solo end-to-end: kernel program, ABI contract, Go agent, exporter, and a CI pipeline that
-loads the program into a real kernel on every commit.
+Per-packet overhead has not been benchmarked yet. The design keeps the hot path to a map lookup and atomic adds, with nothing copied to user space per packet.
 
 ## Architecture
 
@@ -39,14 +35,16 @@ flowchart LR
 
 ## Design highlights
 
-- **Observe-only, never drop** — both hooks always return `1`; a monitoring bug can't become an outage.
-- **Self-contained BPF C** — only `<linux/bpf.h>`; no libbpf headers, no `vmlinux.h`, builds with any BPF-capable clang.
-- **Lock-free hot path** — atomic adds on existing entries, `BPF_NOEXIST` insert with a race fallback, per-CPU health counters.
-- **Pinned ABI** — the key/value layout is asserted from three sides: `unsafe.Sizeof`, `binary.Write` vs. the
+ADRs: [0001 observe-only cgroup_skb hooks](docs/adr/0001-observe-only-cgroup-skb.md), [0002 in-kernel LRU aggregation instead of per-packet events](docs/adr/0002-in-kernel-lru-aggregation.md), [0003 bounded Prometheus cardinality](docs/adr/0003-bounded-metric-cardinality.md).
+
+- **Observe-only, never drop.** Both hooks always return `1`; a monitoring bug can't become an outage.
+- **Self-contained BPF C.** Only `<linux/bpf.h>`; no libbpf headers, no `vmlinux.h`, builds with any BPF-capable clang.
+- **Lock-free hot path.** Atomic adds on existing entries, `BPF_NOEXIST` insert with a race fallback, per-CPU health counters.
+- **Pinned ABI.** The key/value layout is asserted from three sides: `unsafe.Sizeof`, `binary.Write` vs. the
   hand-written encoder, and the BTF of the *compiled* object (`KeySize=40`, `ValueSize=32`).
-- **Correct rates under eviction** — LRU can recycle a flow from zero; deltas detect counter resets instead of wrapping to 2⁶⁴.
-- **Bounded Prometheus cardinality** — only the top-N flows and top-M services become series; the rest is folded into totals.
-- **Probe health is a metric** — `netmon_probe_events_total{event="parse_error"}` etc., plus `netmon_up`.
+- **Correct rates under eviction.** LRU can recycle a flow from zero; deltas detect counter resets instead of wrapping to 2⁶⁴.
+- **Bounded Prometheus cardinality.** Only the top-N flows and top-M services become series; the rest is folded into totals.
+- **Probe health is a metric.** `netmon_probe_events_total{event="parse_error"}` etc., plus `netmon_up`.
 
 ## Quick start
 
@@ -82,6 +80,22 @@ Requires Linux ≥ 5.8 with cgroup v2 and `CAP_BPF` + `CAP_NET_ADMIN` (or root).
 Privileged tests live behind the `integration` build tag and skip themselves when not root,
 so `go test ./...` is safe anywhere; CI runs them on a disposable GitHub runner.
 
+## Limits
+
+- Counts only traffic of sockets inside the attached cgroup subtree. Forwarded or bridged traffic that never touches a local socket (routers, some CNI setups) is invisible; that needs a TC or XDP hook.
+- The flow map holds 16k entries. Under more concurrent flows the LRU evicts the oldest, so long-tail flows can be undercounted; rates stay correct for the flows that remain.
+- Ports are parsed for TCP and UDP only. Other IP protocols are counted per address pair with port 0, non-IP frames as `unsupported`, and IPv6 extension headers are not walked.
+- No per-process or per-container attribution beyond the cgroup you attach to.
+- Needs Linux 5.8+, cgroup v2, `CAP_BPF` and `CAP_NET_ADMIN`. No container image is published, because running it in a container means granting those capabilities anyway.
+
+## Operations
+
+- Metrics and `/healthz` listen on `127.0.0.1:9435` by default; exposing them is an explicit choice (`-listen`).
+- SIGTERM stops the refresh loop, lets an in-flight scrape finish (5 s), then detaches the programs and closes the maps.
+- Metrics server timeouts: 5 s read header, 10 s read and write, 60 s idle.
+
+Threat model and reporting: [SECURITY.md](SECURITY.md).
+
 ## License
 
-MIT © Herman Hoffman (the BPF program is dual-licensed MIT/GPL so the kernel accepts it).
+MIT (the BPF program is dual-licensed MIT/GPL so the kernel accepts it).

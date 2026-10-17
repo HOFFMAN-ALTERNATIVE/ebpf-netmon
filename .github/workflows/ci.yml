@@ -36,6 +36,17 @@ jobs:
           name: netmon-linux-amd64
           path: bin/netmon
 
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
   kernel-integration:
     name: load + attach on a real kernel (sudo)
     needs: build-test

@@ -93,13 +93,25 @@ func run(ctx context.Context, cfg config, out io.Writer, log *slog.Logger) error
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok\n") })
-		srv := &http.Server{Addr: cfg.listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		srv := &http.Server{
+			Addr:              cfg.listen,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
 		go func() {
 			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Error("metrics server", "err", err)
 			}
 		}()
-		defer srv.Close()
+		defer func() {
+			// Let an in-flight scrape finish before the probe is detached.
+			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(sctx)
+		}()
 		log.Info("metrics listening", "addr", cfg.listen)
 	}
 
